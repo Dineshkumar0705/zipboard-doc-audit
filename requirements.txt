@@ -1,0 +1,21 @@
+# Core HTTP & Scraping
+requests
+beautifulsoup4
+lxml
+
+# LLM (Gemini)
+google-genai
+huggingface-hub
+# Environment variables
+python-dotenv
+
+# Google Sheets integration
+gspread
+oauth2client
+
+# Utilities
+tqdm
+
+# Optional (future use / safe)
+pandas
+streamlit
