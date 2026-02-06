@@ -5,23 +5,15 @@ class ArticleJSONStructurer:
     """
     Converts raw scraped article into structured documentation metadata.
 
-    AI usage (Hugging Face only):
-    - Topics covered (zero-shot, multi-label)
-    - Gap detection (question answering, max 3)
-
-    Design goals:
-    - Quota-safe
-    - Deterministic
-    - Never stuck / never empty
-    - Human-readable + machine-consistent output
+    Gap detection philosophy:
+    - Semantic, not checklist-based
+    - Category + content-type aware
+    - Produces clean, aggregation-ready gaps
     """
 
     def __init__(self):
         self.hf = HFClient()
 
-        # --------------------------------------------------
-        # Controlled vocabularies (PRIMARY semantic topics)
-        # --------------------------------------------------
         self.TOPICS = [
             "onboarding",
             "roles and permissions",
@@ -34,39 +26,30 @@ class ArticleJSONStructurer:
             "security"
         ]
 
-        # 🔥 Reduced to 3 → big performance win
-        self.GAP_QUESTIONS = [
-            "Does this article explain prerequisites?",
-            "Does this article explain common errors?",
-            "Does this article explain limitations?"
-        ]
-
     # ==================================================
     # MAIN STRUCTURING
     # ==================================================
     def structure_article(self, article: dict) -> dict:
-        # 🔒 Hard trim → prevents HF freeze
         text = (article.get("raw_text") or "")[:3000]
         title = article.get("title", "") or ""
 
-        # -------- CATEGORY (heuristic, zero cost) --------
         category = self._infer_category_heuristic(title, text)
-
-        # -------- CONTENT TYPE (heuristic, zero cost) --------
         content_type = self._infer_content_type_heuristic(text)
-
-        # -------- TOPICS (semantic + specific) --------
         topics = self._infer_topics(text)
 
-        # -------- GAPS (HF QA, MAX 3) --------
-        gaps = self.hf.detect_gaps(
+        raw_gaps = self._infer_semantic_gaps(
             text=text,
-            questions=self.GAP_QUESTIONS,
-            score_threshold=0.25,
-            max_gaps=3
+            category=category,
+            content_type=content_type
         )
 
-        # -------- SEVERITY --------
+        # 🔑 CANONICALIZE GAPS (CRITICAL FIX)
+        gaps = [self._canonicalize_gap(g) for g in raw_gaps]
+
+        # Remove duplicates while preserving order
+        gaps = list(dict.fromkeys(gaps))
+
+        # Severity is impact-based
         if len(gaps) >= 2:
             severity = "High"
         elif gaps:
@@ -93,73 +76,109 @@ class ArticleJSONStructurer:
         }
 
     # ==================================================
-    # TOPIC INFERENCE (HF + SPECIFIC KEYWORDS)
+    # GAP CANONICALIZATION (NEW – DO NOT REMOVE)
+    # ==================================================
+    def _canonicalize_gap(self, gap: str) -> str:
+        """
+        Converts semantically similar gap phrasings
+        into a single canonical form for aggregation.
+        """
+        g = gap.lower().strip()
+
+        if any(k in g for k in ["example", "workflow", "use case"]):
+            return "missing practical examples or end-to-end user workflows"
+
+        if any(k in g for k in ["error", "fail", "failure", "troubleshoot"]):
+            return "missing guidance on error scenarios and failure handling"
+
+        if any(k in g for k in ["role", "permission", "access"]):
+            return "missing explanation of roles, permissions, and access levels"
+
+        if any(k in g for k in ["limit", "constraint", "restriction", "boundary"]):
+            return "missing documented limitations and usage constraints"
+
+        return g
+
+    # ==================================================
+    # TOPICS
     # ==================================================
     def _infer_topics(self, text: str) -> list:
-        """
-        Layered topic detection:
-        1. HF zero-shot (controlled semantic topics)
-        2. Deterministic keyword extraction (specific topics)
-        3. Guaranteed non-empty
-        """
-
-        # ---- Layer 1: Semantic topics (HF) ----
-        primary_topics = self.hf.detect_topics(
+        primary = self.hf.detect_topics(
             text=text,
             allowed_topics=self.TOPICS,
-            threshold=0.25,   # raised → cleaner + faster
+            threshold=0.25,
             max_topics=3
         )
 
-        # ---- Layer 2: Specific topics (rule-based) ----
-        specific_topics = self._extract_specific_topics(text)
+        specific = self._extract_specific_topics(text)
+        topics = list(dict.fromkeys(primary + specific))
 
-        # ---- Merge (dedupe, preserve order) ----
-        topics = list(dict.fromkeys(primary_topics + specific_topics))
-
-        if topics:
-            return topics[:5]
-
-        # ---- Hard fallback (never empty) ----
-        return ["onboarding"]
+        return topics[:5] if topics else ["onboarding"]
 
     # ==================================================
-    # SPECIFIC TOPIC EXTRACTION (DETERMINISTIC)
+    # SEMANTIC GAP DETECTION
+    # ==================================================
+    def _infer_semantic_gaps(
+        self,
+        text: str,
+        category: str,
+        content_type: str,
+        max_gaps: int = 3
+    ) -> list:
+        """
+        Detects missing SECTIONS users expect.
+        """
+
+        t = text.lower()
+        gaps = []
+
+        # ---- Roles / Access ----
+        if category in {"Roles & Permissions", "Integrations", "API"}:
+            if not any(k in t for k in ["role", "permission", "access"]):
+                gaps.append(
+                    "does not clearly explain required roles, permissions, or access levels"
+                )
+
+        # ---- Error handling ----
+        if category in {"Integrations", "API", "Troubleshooting"}:
+            if not any(k in t for k in ["error", "fail", "issue", "troubleshoot"]):
+                gaps.append(
+                    "missing guidance on error scenarios and failure handling"
+                )
+
+        # ---- Constraints ----
+        if category in {"API", "Integrations"}:
+            if not any(k in t for k in ["limit", "only", "cannot", "restriction"]):
+                gaps.append(
+                    "no documented limitations, constraints, or usage boundaries"
+                )
+
+        # ---- Examples ----
+        if content_type in {"How-to", "Guide"}:
+            if not any(k in t for k in ["example", "workflow", "use case"]):
+                gaps.append(
+                    "lacks practical examples or end-to-end user workflows"
+                )
+
+        return gaps[:max_gaps]
+
+    # ==================================================
+    # SPECIFIC TOPICS
     # ==================================================
     def _extract_specific_topics(self, text: str, max_items: int = 5) -> list:
-        """
-        Extracts fine-grained topics from article text.
-        No LLM. No hallucination. Fast.
-        """
-
         keywords = [
-            "manager",
-            "collaborator",
-            "client",
-            "project",
-            "organization",
-            "permission",
-            "role",
-            "api",
-            "token",
-            "integration",
-            "jira",
-            "webhook",
-            "review",
-            "task"
+            "manager", "collaborator", "client", "project",
+            "organization", "permission", "role", "api",
+            "token", "integration", "jira", "webhook",
+            "review", "task"
         ]
 
         text = text.lower()
-        found = []
-
-        for k in keywords:
-            if k in text:
-                found.append(k)
-
+        found = [k for k in keywords if k in text]
         return list(dict.fromkeys(found))[:max_items]
 
     # ==================================================
-    # CATEGORY HEURISTICS (ZERO COST)
+    # CATEGORY
     # ==================================================
     def _infer_category_heuristic(self, title: str, text: str) -> str:
         t = f"{title} {text}".lower()
@@ -180,14 +199,14 @@ class ArticleJSONStructurer:
         return "General"
 
     # ==================================================
-    # CONTENT TYPE HEURISTICS (ZERO COST)
+    # CONTENT TYPE
     # ==================================================
     def _infer_content_type_heuristic(self, text: str) -> str:
         t = text.lower()
 
         if "step" in t or "follow these" in t or "how to" in t:
             return "How-to"
-        if "frequently asked" in t or "faq" in t:
+        if "faq" in t:
             return "FAQ"
         if "error" in t or "issue" in t:
             return "Troubleshooting"

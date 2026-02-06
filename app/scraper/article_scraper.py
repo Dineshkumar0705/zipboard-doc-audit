@@ -11,7 +11,7 @@ HEADERS = {
 }
 
 REQUEST_TIMEOUT = 15
-REQUEST_DELAY_SEC = 0.5   # prevents throttling & “stuck” feeling
+REQUEST_DELAY_SEC = 0.6  # slightly safer for HelpScout
 
 
 class ZipboardArticleScraper:
@@ -19,14 +19,13 @@ class ZipboardArticleScraper:
     Pure web scraper for zipBoard Help Center.
 
     Responsibilities:
-    1. Discover ALL article URLs via Help Scout collections
+    1. Discover ALL article URLs via HelpScout collections
     2. Scrape ONE article at a time
 
-    Explicitly does NOT:
-    - Run AI
-    - Batch process
-    - Write files
-    - Touch spreadsheets
+    Design guarantees:
+    - Never crashes pipeline
+    - Network failures are safely skipped
+    - Deterministic outputs
     """
 
     def __init__(self):
@@ -37,17 +36,15 @@ class ZipboardArticleScraper:
     # ARTICLE LINK DISCOVERY
     # ==================================================
     def get_all_article_links(self) -> List[str]:
-        print("🔍 Discovering Help Scout collections...")
+        print("🔍 Discovering Help Center collections...")
 
         homepage_html = self._safe_get(BASE_URL)
         if not homepage_html:
+            print("⚠️ Homepage fetch failed")
             return []
 
         soup = BeautifulSoup(homepage_html, "lxml")
 
-        # ----------------------------------------------
-        # Step 1: Collect collection URLs
-        # ----------------------------------------------
         collection_links = set()
 
         for a in soup.select("a[href]"):
@@ -57,41 +54,52 @@ class ZipboardArticleScraper:
 
         print(f"📂 Found {len(collection_links)} collections")
 
-        # ----------------------------------------------
-        # Step 2: Crawl collections → article URLs
-        # ----------------------------------------------
         article_links = set()
 
         for collection_url in collection_links:
             time.sleep(REQUEST_DELAY_SEC)
 
-            collection_html = self._safe_get(collection_url)
-            if not collection_html:
+            html = self._safe_get(collection_url)
+            if not html:
                 continue
 
-            col_soup = BeautifulSoup(collection_html, "lxml")
+            col_soup = BeautifulSoup(html, "lxml")
 
             for a in col_soup.select("a[href]"):
                 href = a.get("href", "").strip()
                 if "/article/" in href:
                     article_links.add(self._absolute_url(href))
 
-        print(f"✅ Discovered {len(article_links)} article URLs")
+        print(f"✅ Discovered {len(article_links)} unique article URLs")
         return sorted(article_links)
 
     # ==================================================
-    # SINGLE ARTICLE SCRAPING
+    # SINGLE ARTICLE SCRAPING (FAIL-SAFE)
     # ==================================================
     def scrape_article(self, url: str, article_id: str) -> Dict:
         print(f"📄 Scraping {article_id}")
 
         time.sleep(REQUEST_DELAY_SEC)
 
-        article_html = self._safe_get(url)
-        if not article_html:
-            raise RuntimeError(f"Failed to fetch article: {url}")
+        html = self._safe_get(url)
 
-        soup = BeautifulSoup(article_html, "lxml")
+        # --------------------------------------------------
+        # 🚨 SAFE FALLBACK (CRITICAL FIX)
+        # --------------------------------------------------
+        if not html:
+            print(f"⚠️ Skipped article due to fetch failure: {url}")
+
+            return {
+                "article_id": article_id,
+                "title": "Unavailable Article",
+                "category": "Unknown",
+                "url": url,
+                "raw_text": "",
+                "has_images": False,
+                "fetch_failed": True
+            }
+
+        soup = BeautifulSoup(html, "lxml")
 
         # ----------------------------------------------
         # Title
@@ -100,34 +108,49 @@ class ZipboardArticleScraper:
         title = title_el.get_text(strip=True) if title_el else "Untitled"
 
         # ----------------------------------------------
-        # Main content (remove footer noise)
+        # Main content extraction
         # ----------------------------------------------
-        paragraphs = []
+        content_nodes = soup.select(
+            "article p, article li, article h2, article h3"
+        )
 
-        for p in soup.find_all("p"):
-            text = p.get_text(" ", strip=True)
+        blocks = []
+
+        for node in content_nodes:
+            text = node.get_text(" ", strip=True)
             if not text:
                 continue
 
-            # Skip HelpScout boilerplate
-            if "contact us" in text.lower():
-                continue
-            if "powered by helpscout" in text.lower():
+            lower = text.lower()
+
+            if any(
+                noise in lower
+                for noise in [
+                    "contact us",
+                    "powered by helpscout",
+                    "was this article helpful",
+                ]
+            ):
                 continue
 
-            paragraphs.append(text)
+            blocks.append(text)
 
-        raw_text = clean_text(" ".join(paragraphs))
+        raw_text = clean_text(" ".join(blocks))
 
         # ----------------------------------------------
-        # Media detection
+        # Image detection (content images only)
         # ----------------------------------------------
-        has_images = bool(soup.find("img"))
+        has_images = False
+        for img in soup.select("article img"):
+            src = img.get("src", "")
+            if src and "icon" not in src.lower():
+                has_images = True
+                break
 
         return {
             "article_id": article_id,
             "title": title,
-            "category": "Unknown",   # filled later
+            "category": "Unknown",  # inferred later
             "url": url,
             "raw_text": raw_text,
             "has_images": has_images

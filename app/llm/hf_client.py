@@ -5,16 +5,18 @@ from app.config import HF_API_TOKEN
 
 class HFClient:
     """
-    Hugging Face client for SCALABLE documentation analysis.
+    Hugging Face client for lightweight semantic signals.
 
-    Responsibilities:
+    Used for:
     - Topic detection (zero-shot, multi-label)
-    - Gap detection (question answering)
 
-    Design guarantees:
+    Optional use:
+    - Shallow gap hints (QA) — NOT primary gap logic
+
+    Guarantees:
     - Free-tier safe
-    - Text truncation (prevents hangs)
-    - Heartbeat logs (no silent freeze)
+    - Truncated input (prevents hangs)
+    - Visible progress logs
     - Never crashes pipeline
     """
 
@@ -24,30 +26,30 @@ class HFClient:
 
         self.client = InferenceClient(token=HF_API_TOKEN)
 
-        # Free-tier friendly, stable models
+        # Free-tier friendly models
         self.ZERO_SHOT_MODEL = "typeform/distilbert-base-uncased-mnli"
         self.QA_MODEL = "deepset/roberta-base-squad2"
 
-        # HARD SAFETY LIMITS
+        # HARD SAFETY LIMIT
         self.MAX_INPUT_CHARS = 2000
 
     # ==================================================
-    # TOPIC DETECTION (ZERO-SHOT, MULTI-LABEL)
+    # TOPIC DETECTION (PRIMARY HF USAGE)
     # ==================================================
     def detect_topics(
         self,
         text: str,
         allowed_topics: list,
-        threshold: float = 0.15,
+        threshold: float = 0.2,
         max_topics: int = 5
     ) -> list:
         """
-        Returns detected topics.
+        Detects high-level semantic topics.
 
         Guarantees:
-        - Never blocks silently
+        - Never blocks
         - Never crashes
-        - Never returns empty list if labels exist
+        - Never returns empty if labels exist
         """
 
         if not text or not allowed_topics:
@@ -55,7 +57,7 @@ class HFClient:
 
         safe_text = text[: self.MAX_INPUT_CHARS]
 
-        print("      🔍 HF: topic detection started...", flush=True)
+        print("      🔍 HF: topic detection started", flush=True)
         start = time.time()
 
         try:
@@ -65,10 +67,14 @@ class HFClient:
                 model=self.ZERO_SHOT_MODEL
             )
         except Exception as e:
-            print("      ⚠️ HF topic detection failed:", e)
+            print("      ⚠️ HF topic detection failed:", e, flush=True)
             return []
 
-        print(f"      ✅ HF: topic detection done ({time.time() - start:.1f}s)", flush=True)
+        print(
+            f"      ✅ HF: topic detection finished "
+            f"({time.time() - start:.1f}s)",
+            flush=True
+        )
 
         # Normalize HF output
         if isinstance(result, list):
@@ -84,30 +90,27 @@ class HFClient:
             if len(topics) == max_topics:
                 break
 
-        # 🔒 HARD FALLBACK
+        # HARD FALLBACK
         if not topics and labels:
             topics = [labels[0]]
 
         return topics
 
     # ==================================================
-    # GAP DETECTION (QUESTION ANSWERING)
+    # GAP QA (OPTIONAL / FALLBACK ONLY)
     # ==================================================
     def detect_gaps(
         self,
         text: str,
         questions: list,
         score_threshold: float = 0.25,
-        max_gaps: int = 5
+        max_gaps: int = 3
     ) -> list:
         """
-        Returns detected documentation gaps.
+        Lightweight QA-based gap hints.
 
-        Guarantees:
-        - Max 5 gaps
-        - No crashes
-        - Truncated context
-        - Visible progress logs
+        ⚠️ NOT primary gap detection.
+        Gemini handles semantic gaps.
         """
 
         if not text or not questions:
@@ -117,7 +120,7 @@ class HFClient:
         gaps = []
 
         for idx, q in enumerate(questions, start=1):
-            print(f"      ❓ HF QA ({idx}/{len(questions)})...", flush=True)
+            print(f"      ❓ HF QA {idx}/{len(questions)}", flush=True)
 
             try:
                 result = self.client.question_answering(
@@ -126,7 +129,7 @@ class HFClient:
                     model=self.QA_MODEL
                 )
             except Exception as e:
-                print("      ⚠️ HF QA failed:", e)
+                print("      ⚠️ HF QA failed:", e, flush=True)
                 continue
 
             score = float(result.get("score", 0.0))
